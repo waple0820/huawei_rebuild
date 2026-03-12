@@ -20,6 +20,8 @@ class DeepseekV3Config(PretrainedConfig):
         num_nextn_predict_layers=0,
         num_attention_heads=128,
         num_key_value_heads=128,
+        num_query_groups=None,
+        group_query_attention=False,
         n_shared_experts=1,
         n_routed_experts=128,
         ep_size=1,
@@ -29,6 +31,7 @@ class DeepseekV3Config(PretrainedConfig):
         qk_rope_head_dim=64,
         v_head_dim=128,
         qk_nope_head_dim=128,
+        qk_layernorm=True,
         topk_method='noaux_tc',
         n_group=8,
         topk_group=2,
@@ -39,11 +42,14 @@ class DeepseekV3Config(PretrainedConfig):
         scoring_func='sigmoid',
         aux_loss_alpha=0.001,
         seq_aux=True,
+        moe_router_enable_expert_bias=False,
+        moe_router_dtype='fp32',
         hidden_act='silu',
         max_position_embeddings=131072,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         use_cache=True,
+        mla_fa_without_pad=False,
         pad_token_id=None,
         bos_token_id=163584,
         eos_token_id=163585,
@@ -63,6 +69,8 @@ class DeepseekV3Config(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.num_attention_heads = num_attention_heads
+        self.num_query_groups = num_query_groups
+        self.group_query_attention = group_query_attention
         self.n_shared_experts = n_shared_experts
         self.n_routed_experts = n_routed_experts
         self.ep_size = ep_size
@@ -72,6 +80,7 @@ class DeepseekV3Config(PretrainedConfig):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_layernorm = qk_layernorm
         self.topk_method = topk_method
         self.n_group = n_group
         self.topk_group = topk_group
@@ -82,7 +91,11 @@ class DeepseekV3Config(PretrainedConfig):
         self.scoring_func = scoring_func
         self.aux_loss_alpha = aux_loss_alpha
         self.seq_aux = seq_aux
-        if num_key_value_heads is None:
+        self.moe_router_enable_expert_bias = moe_router_enable_expert_bias
+        self.moe_router_dtype = moe_router_dtype
+        if group_query_attention and num_query_groups:
+            num_key_value_heads = num_attention_heads // num_query_groups
+        elif num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
@@ -94,6 +107,7 @@ class DeepseekV3Config(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.mla_fa_without_pad = mla_fa_without_pad
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

@@ -76,6 +76,7 @@ class MgCkptConvert:
         num_layer_list: str | None,
         noop_layers: str | None,
         rotary_base: float,
+        q_lora_rank: int,
     ):
         self.mg_load_dir = mg_load_dir
         self.hf_save_dir = hf_save_dir
@@ -101,6 +102,7 @@ class MgCkptConvert:
         self.num_layer_list = num_layer_list
         self.noop_layers_list = sorted(_parse_int_list(noop_layers) or [])
         self.rotary_base = rotary_base
+        self.q_lora_rank = q_lora_rank
 
         os.makedirs(self.hf_save_dir, exist_ok=True)
 
@@ -334,6 +336,54 @@ class MgCkptConvert:
         q_up_key = f'{prefix}.linear_q_up_proj.weight'
         kv_up_key = f'{prefix}.linear_kv_up_proj.weight'
 
+        if kv_norm_key not in models[(0, 0)]:
+            k_norm_key = f'{prefix}.k_layernorm.weight'
+            linear_proj_list: list[torch.Tensor] = []
+            q_parts: list[torch.Tensor] = []
+            k_parts: list[torch.Tensor] = []
+            v_parts: list[torch.Tensor] = []
+
+            head_dim = self.hidden_size // self.num_attention_heads
+            if self.num_attention_heads % self.tp_size != 0:
+                raise ValueError(
+                    f'num_attention_heads={self.num_attention_heads} 不能整除 tp_size={self.tp_size}'
+                )
+            q_per_tp = (self.num_attention_heads // self.tp_size) * head_dim
+
+            for tp_rank in range(self.tp_size):
+                linear_proj_list.append(models[(tp_rank,
+                                                0)].pop(proj_key).clone())
+                qkv_shard = models[(tp_rank, 0)].pop(qkv_key)
+                rem = qkv_shard.shape[0] - q_per_tp
+                if rem < 0 or rem % 2 != 0:
+                    raise ValueError(
+                        f'{qkv_key} 分片形状异常: {qkv_shard.shape}, q_per_tp={q_per_tp}'
+                    )
+                kv_per_tp = rem // 2
+                q_r, k_r, v_r = torch.split(qkv_shard,
+                                            [q_per_tp, kv_per_tp, kv_per_tp],
+                                            dim=0)
+                q_parts.append(q_r.clone())
+                k_parts.append(k_r.clone())
+                v_parts.append(v_r.clone())
+
+            o_proj = torch.cat(linear_proj_list, dim=1)
+            hf[f'model.layers.{hf_layer}.self_attn.q_proj.weight'] = torch.cat(
+                q_parts, dim=0).clone()
+            hf[f'model.layers.{hf_layer}.self_attn.k_proj.weight'] = torch.cat(
+                k_parts, dim=0).clone()
+            hf[f'model.layers.{hf_layer}.self_attn.v_proj.weight'] = torch.cat(
+                v_parts, dim=0).clone()
+            hf[f'model.layers.{hf_layer}.self_attn.o_proj.weight'] = o_proj.clone(
+            )
+            hf[f'model.layers.{hf_layer}.self_attn.q_layernorm.weight'] = models[
+                (0, 0)].pop(q_norm_key).clone()
+            hf[f'model.layers.{hf_layer}.self_attn.k_layernorm.weight'] = models[
+                (0, 0)].pop(k_norm_key).clone()
+            hf[f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq'] = self.inv_freq.clone(
+            )
+            return
+
         linear_proj_list: list[torch.Tensor] = []
         linear_qb_list: list[torch.Tensor] = []
         linear_kvb_list: list[torch.Tensor] = []
@@ -390,12 +440,12 @@ class MgCkptConvert:
             kv_b_proj = torch.cat(linear_kvb_list, dim=0)
 
         qkv = models[(0, 0)].pop(qkv_key)
-        if qkv.shape[0] < Q_LORA_RANK:
+        if qkv.shape[0] < self.q_lora_rank:
             raise ValueError(
-                f'linear_qkv.weight 行数 {qkv.shape[0]} 小于 Q_LORA_RANK={Q_LORA_RANK}'
+                f'linear_qkv.weight 行数 {qkv.shape[0]} 小于 q_lora_rank={self.q_lora_rank}'
             )
-        q_a_proj = qkv[:Q_LORA_RANK, :].clone()
-        kv_a_proj = qkv[Q_LORA_RANK:, :].clone()
+        q_a_proj = qkv[:self.q_lora_rank, :].clone()
+        kv_a_proj = qkv[self.q_lora_rank:, :].clone()
         q_a_ln = models[(0, 0)].pop(q_norm_key)
         kv_a_ln = models[(0, 0)].pop(kv_norm_key)
 
@@ -691,6 +741,34 @@ def get_args():
                         type=float,
                         default=50000.0,
                         help='Rotary base for RoPE')
+    parser.add_argument('--hidden-size',
+                        type=int,
+                        default=None,
+                        help='Override hidden size.')
+    parser.add_argument('--num-experts',
+                        type=int,
+                        default=None,
+                        help='Override num experts.')
+    parser.add_argument('--num-attention-heads',
+                        type=int,
+                        default=None,
+                        help='Override attention heads.')
+    parser.add_argument('--qk-head-dim',
+                        type=int,
+                        default=None,
+                        help='Override qk head dim (MLA).')
+    parser.add_argument('--v-head-dim',
+                        type=int,
+                        default=None,
+                        help='Override v head dim (MLA).')
+    parser.add_argument('--qk-pos-emb-head-dim',
+                        type=int,
+                        default=None,
+                        help='Override qk pos emb head dim (MLA).')
+    parser.add_argument('--q-lora-rank',
+                        type=int,
+                        default=Q_LORA_RANK,
+                        help='q LoRA rank used by MLA.')
 
     args = parser.parse_args()
     return args
@@ -699,6 +777,12 @@ def get_args():
 def main() -> None:
     args = get_args()
     logger.info('Arguments: %s', args)
+    hidden_size = args.hidden_size or HIDDEN_SIZE
+    num_experts = args.num_experts or NUM_EXPERTS
+    num_attention_heads = args.num_attention_heads or NUM_ATTENTION_HEADS
+    qk_head_dim = args.qk_head_dim or QK_HEAD_DIM
+    v_head_dim = args.v_head_dim or V_HEAD_DIM
+    qk_pos_emb_head_dim = args.qk_pos_emb_head_dim or QK_POS_EMB_HEAD_DIM
     converter = MgCkptConvert(
         mg_load_dir=args.load_dir,
         hf_save_dir=args.save_dir,
@@ -707,12 +791,12 @@ def main() -> None:
         pp_size=args.source_pipeline_parallel_size,
         ep_size=args.source_expert_parallel_size,
         first_k_dense_replace=args.first_k_dense_replace,
-        hidden_size=HIDDEN_SIZE,
-        num_experts=NUM_EXPERTS,
-        num_attention_heads=NUM_ATTENTION_HEADS,
-        qk_head_dim=QK_HEAD_DIM,
-        v_head_dim=V_HEAD_DIM,
-        qk_pos_emb_head_dim=QK_POS_EMB_HEAD_DIM,
+        hidden_size=hidden_size,
+        num_experts=num_experts,
+        num_attention_heads=num_attention_heads,
+        qk_head_dim=qk_head_dim,
+        v_head_dim=v_head_dim,
+        qk_pos_emb_head_dim=qk_pos_emb_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,
         moe_tp_extend_ep=args.moe_tp_extend_ep,
         mla_mm_split=args.mla_mm_split,
@@ -721,6 +805,7 @@ def main() -> None:
         num_layer_list=args.num_layer_list,
         noop_layers=args.noop_layers,
         rotary_base=args.rotary_base,
+        q_lora_rank=args.q_lora_rank,
     )
     converter.run()
 

@@ -26,6 +26,14 @@ def _parse_int_list(value: Optional[str]) -> Optional[list[int]]:
     return list(map(int, value.split(',')))
 
 
+def _read_hf_config(model_dir: str) -> dict:
+    cfg_path = os.path.join(model_dir, 'config.json')
+    if not os.path.isfile(cfg_path):
+        return {}
+    with open(cfg_path) as f:
+        return json.load(f)
+
+
 def _ensure_iter_path(save_dir: str) -> str:
     iter_dir = os.path.join(save_dir, 'iter_0000001')
     os.makedirs(iter_dir, exist_ok=True)
@@ -351,89 +359,128 @@ class CkptConvert:
         weights: dict[str, torch.Tensor],
         mg_model: dict[int, dict[int, dict[str, torch.Tensor]]],
     ) -> None:
-        q_a = weights.pop(f'model.layers.{hf_layer}.self_attn.q_a_proj.weight')
-        kv_a = weights.pop(
-            f'model.layers.{hf_layer}.self_attn.kv_a_proj_with_mqa.weight')
-        qkv_weight = torch.cat(
-            [
-                q_a.reshape((-1, self.hidden_size)),
-                kv_a.reshape((-1, self.hidden_size))
-            ],
-            dim=0,
-        )
-        o_proj = weights.pop(
-            f'model.layers.{hf_layer}.self_attn.o_proj.weight')
-        q_ln = weights.pop(
-            f'model.layers.{hf_layer}.self_attn.q_a_layernorm.weight')
-        kv_ln = weights.pop(
-            f'model.layers.{hf_layer}.self_attn.kv_a_layernorm.weight')
-        q_b_proj = weights.pop(
-            f'model.layers.{hf_layer}.self_attn.q_b_proj.weight')
-        kv_b_proj = weights.pop(
-            f'model.layers.{hf_layer}.self_attn.kv_b_proj.weight')
-
         prefix = f'decoder.layers.{local_layer_idx}.self_attention'
         qkv_key = f'{prefix}.linear_qkv.weight'
         proj_key = f'{prefix}.linear_proj.weight'
+
+        q_a_key = f'model.layers.{hf_layer}.self_attn.q_a_proj.weight'
+        if q_a_key in weights:
+            q_a = weights.pop(q_a_key)
+            kv_a = weights.pop(
+                f'model.layers.{hf_layer}.self_attn.kv_a_proj_with_mqa.weight')
+            qkv_weight = torch.cat(
+                [
+                    q_a.reshape((-1, self.hidden_size)),
+                    kv_a.reshape((-1, self.hidden_size))
+                ],
+                dim=0,
+            )
+            o_proj = weights.pop(
+                f'model.layers.{hf_layer}.self_attn.o_proj.weight')
+            q_ln = weights.pop(
+                f'model.layers.{hf_layer}.self_attn.q_a_layernorm.weight')
+            kv_ln = weights.pop(
+                f'model.layers.{hf_layer}.self_attn.kv_a_layernorm.weight')
+            q_b_proj = weights.pop(
+                f'model.layers.{hf_layer}.self_attn.q_b_proj.weight')
+            kv_b_proj = weights.pop(
+                f'model.layers.{hf_layer}.self_attn.kv_b_proj.weight')
+
+            q_norm_key = f'{prefix}.q_layernorm.weight'
+            kv_norm_key = f'{prefix}.kv_layernorm.weight'
+
+            if self.mla_mm_split:
+                qk_nope_key = f'{prefix}.linear_qk_nope.weight'
+                qk_rope_key = f'{prefix}.linear_qk_rope.weight'
+                kv_nope_key = f'{prefix}.linear_kv_nope.weight'
+                linear_v_key = f'{prefix}.linear_v.weight'
+
+                q_b_proj = q_b_proj.reshape(
+                    self.num_attention_heads,
+                    (self.qk_head_dim + self.qk_pos_emb_head_dim), -1)
+                kv_b_proj = kv_b_proj.reshape(
+                    self.num_attention_heads,
+                    (self.qk_head_dim + self.v_head_dim), -1)
+
+                qk_nope = q_b_proj[:, :self.qk_head_dim].reshape(
+                    -1, self.hidden_size)
+                qk_rope = q_b_proj[:, self.qk_head_dim:].reshape(
+                    -1, self.hidden_size)
+                kv_nope = kv_b_proj[:, :self.qk_head_dim].reshape(
+                    -1, self.hidden_size)
+                linear_v = kv_b_proj[:, self.qk_head_dim:].reshape(
+                    -1, self.hidden_size)
+
+                qk_nope_tp = torch.chunk(qk_nope, self.tp_size, dim=0)
+                qk_rope_tp = torch.chunk(qk_rope, self.tp_size, dim=0)
+                kv_nope_tp = torch.chunk(kv_nope, self.tp_size, dim=0)
+                linear_v_tp = torch.chunk(linear_v, self.tp_size, dim=0)
+            else:
+                q_up_key = f'{prefix}.linear_q_up_proj.weight'
+                kv_up_key = f'{prefix}.linear_kv_up_proj.weight'
+                q_b_tp = torch.chunk(q_b_proj, self.tp_size, dim=0)
+                kv_b_tp = torch.chunk(kv_b_proj, self.tp_size, dim=0)
+
+            o_proj_tp = torch.chunk(o_proj, self.tp_size, dim=1)
+            for ep_rank in range(self.ep_size):
+                for tp_rank in range(self.tp_size):
+                    mg_model[ep_rank][tp_rank][qkv_key] = qkv_weight.clone()
+                    mg_model[ep_rank][tp_rank][proj_key] = o_proj_tp[
+                        tp_rank].clone()
+                    mg_model[ep_rank][tp_rank][q_norm_key] = q_ln.clone()
+                    mg_model[ep_rank][tp_rank][kv_norm_key] = kv_ln.clone()
+
+                    if self.mla_mm_split:
+                        mg_model[ep_rank][tp_rank][qk_nope_key] = qk_nope_tp[
+                            tp_rank].clone()
+                        mg_model[ep_rank][tp_rank][qk_rope_key] = qk_rope_tp[
+                            tp_rank].clone()
+                        mg_model[ep_rank][tp_rank][kv_nope_key] = kv_nope_tp[
+                            tp_rank].clone()
+                        mg_model[ep_rank][tp_rank][linear_v_key] = linear_v_tp[
+                            tp_rank].clone()
+                    else:
+                        mg_model[ep_rank][tp_rank][q_up_key] = q_b_tp[
+                            tp_rank].clone()
+                        mg_model[ep_rank][tp_rank][kv_up_key] = kv_b_tp[
+                            tp_rank].clone()
+
+                    self._maybe_quant_nf4(mg_model[ep_rank][tp_rank], proj_key,
+                                          o_proj_tp[tp_rank].clone())
+            return
+
+        q_weight = weights.pop(
+            f'model.layers.{hf_layer}.self_attn.q_proj.weight')
+        k_weight = weights.pop(
+            f'model.layers.{hf_layer}.self_attn.k_proj.weight')
+        v_weight = weights.pop(
+            f'model.layers.{hf_layer}.self_attn.v_proj.weight')
+        o_proj = weights.pop(
+            f'model.layers.{hf_layer}.self_attn.o_proj.weight')
+        q_ln = weights.pop(
+            f'model.layers.{hf_layer}.self_attn.q_layernorm.weight')
+        k_ln = weights.pop(
+            f'model.layers.{hf_layer}.self_attn.k_layernorm.weight')
+        weights.pop(f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq',
+                    None)
+
         q_norm_key = f'{prefix}.q_layernorm.weight'
-        kv_norm_key = f'{prefix}.kv_layernorm.weight'
+        k_norm_key = f'{prefix}.k_layernorm.weight'
 
-        if self.mla_mm_split:
-            qk_nope_key = f'{prefix}.linear_qk_nope.weight'
-            qk_rope_key = f'{prefix}.linear_qk_rope.weight'
-            kv_nope_key = f'{prefix}.linear_kv_nope.weight'
-            linear_v_key = f'{prefix}.linear_v.weight'
-
-            q_b_proj = q_b_proj.reshape(
-                self.num_attention_heads,
-                (self.qk_head_dim + self.qk_pos_emb_head_dim), -1)
-            kv_b_proj = kv_b_proj.reshape(self.num_attention_heads,
-                                          (self.qk_head_dim + self.v_head_dim),
-                                          -1)
-
-            qk_nope = q_b_proj[:, :self.qk_head_dim].reshape(
-                -1, self.hidden_size)
-            qk_rope = q_b_proj[:, self.qk_head_dim:].reshape(
-                -1, self.hidden_size)
-            kv_nope = kv_b_proj[:, :self.qk_head_dim].reshape(
-                -1, self.hidden_size)
-            linear_v = kv_b_proj[:, self.qk_head_dim:].reshape(
-                -1, self.hidden_size)
-
-            qk_nope_tp = torch.chunk(qk_nope, self.tp_size, dim=0)
-            qk_rope_tp = torch.chunk(qk_rope, self.tp_size, dim=0)
-            kv_nope_tp = torch.chunk(kv_nope, self.tp_size, dim=0)
-            linear_v_tp = torch.chunk(linear_v, self.tp_size, dim=0)
-        else:
-            q_up_key = f'{prefix}.linear_q_up_proj.weight'
-            kv_up_key = f'{prefix}.linear_kv_up_proj.weight'
-            q_b_tp = torch.chunk(q_b_proj, self.tp_size, dim=0)
-            kv_b_tp = torch.chunk(kv_b_proj, self.tp_size, dim=0)
-
+        q_tp = torch.chunk(q_weight, self.tp_size, dim=0)
+        k_tp = torch.chunk(k_weight, self.tp_size, dim=0)
+        v_tp = torch.chunk(v_weight, self.tp_size, dim=0)
         o_proj_tp = torch.chunk(o_proj, self.tp_size, dim=1)
+
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
-                mg_model[ep_rank][tp_rank][qkv_key] = qkv_weight.clone()
+                mg_model[ep_rank][tp_rank][qkv_key] = torch.cat(
+                    [q_tp[tp_rank], k_tp[tp_rank], v_tp[tp_rank]],
+                    dim=0).clone()
                 mg_model[ep_rank][tp_rank][proj_key] = o_proj_tp[
                     tp_rank].clone()
                 mg_model[ep_rank][tp_rank][q_norm_key] = q_ln.clone()
-                mg_model[ep_rank][tp_rank][kv_norm_key] = kv_ln.clone()
-
-                if self.mla_mm_split:
-                    mg_model[ep_rank][tp_rank][qk_nope_key] = qk_nope_tp[
-                        tp_rank].clone()
-                    mg_model[ep_rank][tp_rank][qk_rope_key] = qk_rope_tp[
-                        tp_rank].clone()
-                    mg_model[ep_rank][tp_rank][kv_nope_key] = kv_nope_tp[
-                        tp_rank].clone()
-                    mg_model[ep_rank][tp_rank][linear_v_key] = linear_v_tp[
-                        tp_rank].clone()
-                else:
-                    mg_model[ep_rank][tp_rank][q_up_key] = q_b_tp[
-                        tp_rank].clone()
-                    mg_model[ep_rank][tp_rank][kv_up_key] = kv_b_tp[
-                        tp_rank].clone()
-
+                mg_model[ep_rank][tp_rank][k_norm_key] = k_ln.clone()
                 self._maybe_quant_nf4(mg_model[ep_rank][tp_rank], proj_key,
                                       o_proj_tp[tp_rank].clone())
 
@@ -758,6 +805,32 @@ def get_args():
                         type=int,
                         default=3,
                         help='Customizing the number of dense layers.')
+    parser.add_argument('--hidden-size',
+                        type=int,
+                        default=None,
+                        help='Override hidden size (default: from HF config).')
+    parser.add_argument('--num-experts',
+                        type=int,
+                        default=None,
+                        help='Override num experts (default: from HF config).')
+    parser.add_argument(
+        '--num-attention-heads',
+        type=int,
+        default=None,
+        help='Override attention heads (default: from HF config).',
+    )
+    parser.add_argument('--qk-head-dim',
+                        type=int,
+                        default=None,
+                        help='Override qk head dim (MLA).')
+    parser.add_argument('--v-head-dim',
+                        type=int,
+                        default=None,
+                        help='Override v head dim (MLA).')
+    parser.add_argument('--qk-pos-emb-head-dim',
+                        type=int,
+                        default=None,
+                        help='Override qk pos emb head dim (MLA).')
     parser.add_argument(
         '--moe-tp-extend-ep',
         action='store_true',
@@ -785,6 +858,15 @@ def get_args():
 def main() -> None:
     args = get_args()
     logger.info('Arguments: %s', args)
+    hf_cfg = _read_hf_config(args.load_dir)
+    hidden_size = args.hidden_size or hf_cfg.get('hidden_size') or HIDDEN_SIZE
+    num_experts = args.num_experts or hf_cfg.get('num_experts') or hf_cfg.get(
+        'n_experts') or NUM_EXPERTS
+    num_attention_heads = args.num_attention_heads or hf_cfg.get(
+        'num_attention_heads') or NUM_ATTENTION_HEADS
+    qk_head_dim = args.qk_head_dim or QK_HEAD_DIM
+    v_head_dim = args.v_head_dim or V_HEAD_DIM
+    qk_pos_emb_head_dim = args.qk_pos_emb_head_dim or QK_POS_EMB_HEAD_DIM
     converter = CkptConvert(
         hf_model_path=args.load_dir,
         mg_save_path=args.save_dir,
@@ -793,12 +875,12 @@ def main() -> None:
         pp_size=args.target_pipeline_parallel_size,
         ep_size=args.target_expert_parallel_size,
         first_k_dense_replace=args.first_k_dense_replace,
-        hidden_size=HIDDEN_SIZE,
-        num_experts=NUM_EXPERTS,
-        num_attention_heads=NUM_ATTENTION_HEADS,
-        qk_head_dim=QK_HEAD_DIM,
-        v_head_dim=V_HEAD_DIM,
-        qk_pos_emb_head_dim=QK_POS_EMB_HEAD_DIM,
+        hidden_size=hidden_size,
+        num_experts=num_experts,
+        num_attention_heads=num_attention_heads,
+        qk_head_dim=qk_head_dim,
+        v_head_dim=v_head_dim,
+        qk_pos_emb_head_dim=qk_pos_emb_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,
         moe_tp_extend_ep=args.moe_tp_extend_ep,
         mla_mm_split=args.mla_mm_split,
