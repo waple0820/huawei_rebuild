@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# OpenCompass outputs
+outputs/
+work_dirs/
+tmp/
+
+# Downloaded datasets (large, do not commit)
+data/
+
+# VLMEvalKit clone (external dependency)
+VLMEvalKit/
+
+# Multimodal evaluation outputs
+outputs_vl/
+
+# vLLM cache
+*.cache
+
+# Jupyter
+.ipynb_checkpoints/

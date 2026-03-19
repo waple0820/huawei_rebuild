@@ -257,13 +257,28 @@ class MgCkptConvert:
 
     def _load_rank_state(self, tp_rank: int, pp_rank: int, ep_rank: int,
                          vpp_rank: int | None) -> dict[str, torch.Tensor]:
-        prefix = _mp_prefix(tp_rank, pp_rank, ep_rank, self.tp_size,
+        if self.moe_tp_extend_ep and self.ep_size > 1:
+            real_ep_suffix = ep_rank * self.tp_size + tp_rank
+        else:
+            real_ep_suffix = ep_rank
+        
+        prefix = _mp_prefix(tp_rank, pp_rank, real_ep_suffix, self.tp_size,
                             self.pp_size, self.ep_size)
         ckpt_path = os.path.join(self.iter_dir, prefix, 'model_optim_rng.pt')
+
+        logger.info(f'Loading checkpoint from {ckpt_path}')
+
         state = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         if vpp_rank is None:
-            return state['model']
-        return state[f'model{vpp_rank}']
+            model_weights = state.pop('model')
+        else:
+            model_weights = state.pop(f'model{vpp_rank}')
+
+        del state
+        import gc
+        gc.collect()
+
+        return model_weights
 
     def _load_models_for_stage(
         self, pp_rank: int, vpp_rank: int | None
@@ -492,17 +507,17 @@ class MgCkptConvert:
             fc1 = self._gather_tp_row(models, f'{prefix}.linear_fc1.weight')
             fc2 = self._gather_tp_col(models, f'{prefix}.linear_fc2.weight')
             gate, up = torch.chunk(fc1, 2, dim=0)
-            hf[f'model.layers.{hf_layer}.mlp.gate_proj.weight'] = gate.clone()
-            hf[f'model.layers.{hf_layer}.mlp.up_proj.weight'] = up.clone()
-            hf[f'model.layers.{hf_layer}.mlp.down_proj.weight'] = fc2.clone()
+            hf[f'model.layers.{hf_layer}.mlp.gate_proj.weight'] = gate.contiguous().clone()
+            hf[f'model.layers.{hf_layer}.mlp.up_proj.weight'] = up.contiguous().clone()
+            hf[f'model.layers.{hf_layer}.mlp.down_proj.weight'] = fc2.contiguous().clone()
             return
 
         router = self._reconstruct_router(models, f'{prefix}.router.weight')
         router_bias = self._reconstruct_router(models,
                                                f'{prefix}.router.expert_bias')
 
-        hf[f'model.layers.{hf_layer}.mlp.gate.weight'] = router.clone()
-        hf[f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias'] = router_bias.clone(
+        hf[f'model.layers.{hf_layer}.mlp.gate.weight'] = router.contiguous().clone()
+        hf[f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias'] = router_bias.contiguous().clone(
         )
 
         shared_fc1 = self._gather_tp_row(
@@ -510,11 +525,11 @@ class MgCkptConvert:
         shared_fc2 = self._gather_tp_col(
             models, f'{prefix}.shared_experts.linear_fc2.weight')
         shared_gate, shared_up = torch.chunk(shared_fc1, 2, dim=0)
-        hf[f'model.layers.{hf_layer}.mlp.shared_experts.gate_proj.weight'] = shared_gate.clone(
+        hf[f'model.layers.{hf_layer}.mlp.shared_experts.gate_proj.weight'] = shared_gate.contiguous().clone(
         )
-        hf[f'model.layers.{hf_layer}.mlp.shared_experts.up_proj.weight'] = shared_up.clone(
+        hf[f'model.layers.{hf_layer}.mlp.shared_experts.up_proj.weight'] = shared_up.contiguous().clone(
         )
-        hf[f'model.layers.{hf_layer}.mlp.shared_experts.down_proj.weight'] = shared_fc2.clone(
+        hf[f'model.layers.{hf_layer}.mlp.shared_experts.down_proj.weight'] = shared_fc2.contiguous().clone(
         )
 
         if self.moe_grouped_gemm:
@@ -539,11 +554,11 @@ class MgCkptConvert:
                     fc1 = fc1_t.t()
                     gate, up = torch.chunk(fc1, 2, dim=0)
                     down = w2_3d[expert].t()
-                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.clone(
+                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.contiguous().clone(
                     )
-                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.clone(
+                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.contiguous().clone(
                     )
-                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = down.clone(
+                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = down.contiguous().clone(
                     )
             else:
                 num_local = self.num_experts // self.ep_size
@@ -566,11 +581,11 @@ class MgCkptConvert:
                         fc1 = w1_3d[li].t()
                         gate, up = torch.chunk(fc1, 2, dim=0)
                         down = w2_3d[li].t()
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.clone(
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.contiguous().clone(
                         )
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.clone(
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.contiguous().clone(
                         )
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = down.clone(
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = down.contiguous().clone(
                         )
         else:
             num_local = self.num_experts // self.ep_size
@@ -587,11 +602,11 @@ class MgCkptConvert:
                         f'{local_prefix}.linear_fc2.weight',
                         ep_rank=ep_rank)
                     gate, up = torch.chunk(fc1, 2, dim=0)
-                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.clone(
+                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.contiguous().clone(
                     )
-                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.clone(
+                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.contiguous().clone(
                     )
-                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = fc2.clone(
+                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = fc2.contiguous().clone(
                     )
 
     def _save_shard(self, tensors: dict[str, torch.Tensor], shard_idx: int,
@@ -626,6 +641,11 @@ class MgCkptConvert:
                 self._save_shard(layer_tensors, shard_idx, total_shards)
                 shard_idx += 1
 
+                del models
+                del layer_tensors
+                import gc
+                gc.collect()
+
             models_last = self._load_models_for_stage(pp_rank=self.pp_size - 1,
                                                       vpp_rank=None)
             tail_tensors: dict[str, torch.Tensor] = {}
@@ -650,6 +670,11 @@ class MgCkptConvert:
                 self._set_layer_mlp(layer_tensors, models, hf_layer, local_idx)
                 self._save_shard(layer_tensors, shard_idx, total_shards)
                 shard_idx += 1
+
+                del models
+                del layer_tensors
+                import gc
+                gc.collect()
 
             if self.dualpipe:
                 models01 = self._load_models_for_stage(pp_rank=0, vpp_rank=1)
